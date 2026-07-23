@@ -1,0 +1,273 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>临时文件同步 - 仪表板</title>
+<style>
+body { font-family: sans-serif; max-width: 700px; margin: auto; padding: 16px; }
+input, textarea, button { width: 100%; margin: 8px 0; padding: 10px; box-sizing: border-box; }
+#fileList div { background: #f5f5f5; margin: 4px 0; padding: 8px; display: flex; justify-content: space-between; align-items: center; }
+a { color: #0366d6; text-decoration: none; }
+button { background: #2ea44f; color: white; border: none; cursor: pointer; }
+button.del { background: #d73a49; width: auto; }
+.limit-note { color: #666; font-size: 0.9em; margin: -4px 0 8px; }
+.status-bar { background: #eef; padding: 12px; border-radius: 8px; margin-bottom: 20px; }
+.status-item { display: flex; justify-content: space-between; margin: 4px 0; font-size: 0.95em; }
+.status-label { color: #333; }
+.status-value { font-weight: bold; }
+.warning { color: #c0392b; }
+</style>
+</head>
+<body>
+<h2>📁 临时文件同步 · 仪表板</h2>
+
+<!-- 状态栏 -->
+<div class="status-bar" id="statusBar">
+  <div class="status-item"><span class="status-label">仓库已用大小</span><span class="status-value" id="repoSize">-</span></div>
+  <div class="status-item"><span class="status-label">GitHub Pages 限制</span><span class="status-value">源仓库 ≤ 1GB，站点 ≤ 1GB，带宽 ≤ 100GB/月</span></div>
+  <div class="status-item"><span class="status-label">今日 API 已用</span><span class="status-value" id="apiUsed">-</span></div>
+  <div class="status-item"><span class="status-label">今日 API 剩余</span><span class="status-value" id="apiRemaining">-</span></div>
+  <div class="status-item"><span class="status-label">重置时间</span><span class="status-value" id="apiReset">-</span></div>
+</div>
+
+<p>输入你的 GitHub Personal Access Token（只保存在本机浏览器）</p>
+<input id="tokenInput" placeholder="ghp_xxxxxxxxxxxx" />
+<button onclick="saveToken()">保存 Token</button>
+<hr>
+
+<h3>📝 保存文本</h3>
+<input id="textName" placeholder="文件名（如 note.txt）" />
+<textarea id="textContent" rows="4" placeholder="输入文本内容"></textarea>
+<p class="limit-note">文本内容建议不超过 1 MB（约 100 万字符）</p>
+<button onclick="saveText()">保存文本</button>
+
+<h3>🖼️ 上传文件（图片、PDF等）</h3>
+<p class="limit-note">文件大小限制：50 MB（超过将无法上传）</p>
+<input type="file" id="fileInput" />
+<button onclick="uploadFile()">上传文件</button>
+
+<h3>📄 已有文件列表</h3>
+<div id="fileList">加载中...</div>
+
+<script>
+const OWNER = '你的GitHub用户名'; // ← 改成你自己的
+const REPO = 'temp-share';
+const BRANCH = 'main';
+const FOLDER = 'files';
+const MAX_FILE_SIZE_MB = 50;
+const MAX_TEXT_CHARS = 1000000;
+
+// ---------- 工具函数 ----------
+function getToken() {
+  return document.getElementById('tokenInput').value || localStorage.getItem('gh_token') || '';
+}
+
+function saveToken() {
+  const t = document.getElementById('tokenInput').value;
+  if(t) localStorage.setItem('gh_token', t);
+  alert('Token 已保存');
+}
+
+// ---------- API 调用封装（自动更新速率限制显示）----------
+let lastRateLimit = { limit: 5000, remaining: 5000, reset: 0 };
+
+function updateRateDisplay(headers) {
+  if (!headers) return;
+  const limit = parseInt(headers.get('X-RateLimit-Limit'));
+  const remaining = parseInt(headers.get('X-RateLimit-Remaining'));
+  const reset = parseInt(headers.get('X-RateLimit-Reset'));
+  if (!isNaN(limit) && !isNaN(remaining) && !isNaN(reset)) {
+    lastRateLimit = { limit, remaining, reset };
+    const used = limit - remaining;
+    document.getElementById('apiUsed').textContent = used;
+    document.getElementById('apiRemaining').textContent = remaining;
+    const resetDate = new Date(reset * 1000);
+    document.getElementById('apiReset').textContent = resetDate.toLocaleTimeString() + ' (' + resetDate.toLocaleDateString() + ')';
+  }
+}
+
+async function apiCall(method, path, body) {
+  const token = getToken();
+  if(!token) throw new Error('请先输入 Token');
+  const url = `https://api.github.com/repos/${OWNER}/${REPO}/contents/${path}`;
+  const options = {
+    method,
+    headers: {
+      'Authorization': `Bearer ${token}`,
+      'Accept': 'application/vnd.github.v3+json',
+      'Content-Type': 'application/json'
+    }
+  };
+  if(body) options.body = JSON.stringify(body);
+  const res = await fetch(url, options);
+  // 更新速率限制显示
+  updateRateDisplay(res.headers);
+  if (!res.ok && res.status !== 404) {
+    const err = await res.json();
+    throw new Error(err.message || 'API error');
+  }
+  return res;
+}
+
+// ---------- 获取仓库大小 ----------
+async function fetchRepoSize() {
+  const token = getToken();
+  if (!token) return;
+  try {
+    const url = `https://api.github.com/repos/${OWNER}/${REPO}`;
+    const res = await fetch(url, {
+      headers: { 'Authorization': `Bearer ${token}`, 'Accept': 'application/vnd.github.v3+json' }
+    });
+    updateRateDisplay(res.headers);
+    if (!res.ok) return;
+    const data = await res.json();
+    // size 单位 KB
+    const sizeKB = data.size;
+    const sizeMB = (sizeKB / 1024).toFixed(2);
+    document.getElementById('repoSize').textContent = sizeMB + ' MB';
+  } catch(e) {
+    console.error('获取仓库大小失败', e);
+  }
+}
+
+// ---------- 文件列表操作 ----------
+async function listFiles() {
+  const res = await apiCall('GET', FOLDER);
+  if (res.status === 404) return [];
+  const data = await res.json();
+  if (!Array.isArray(data)) return [data];
+  return data.filter(item => item.type === 'file');
+}
+
+async function refreshList() {
+  const container = document.getElementById('fileList');
+  container.innerHTML = '加载中...';
+  try {
+    const files = await listFiles();
+    if (files.length === 0) {
+      container.innerHTML = '<div>暂无文件</div>';
+      return;
+    }
+    container.innerHTML = '';
+    for (const file of files) {
+      const div = document.createElement('div');
+      const link = document.createElement('a');
+      link.href = file.download_url;
+      link.target = '_blank';
+      link.textContent = file.name;
+      const delBtn = document.createElement('button');
+      delBtn.className = 'del';
+      delBtn.textContent = '删除';
+      delBtn.onclick = async () => {
+        if (!confirm('确定删除?')) return;
+        await deleteFile(file.path, file.sha);
+        refreshList();
+      };
+      div.appendChild(link);
+      div.appendChild(delBtn);
+      container.appendChild(div);
+    }
+  } catch(e) {
+    container.innerHTML = `<div style="color:red">错误: ${e.message}</div>`;
+  }
+}
+
+// ---------- 保存文本 ----------
+async function saveText() {
+  const name = document.getElementById('textName').value.trim();
+  const content = document.getElementById('textContent').value;
+  if (!name || !content) return alert('文件名和内容不能为空');
+  if (content.length > MAX_TEXT_CHARS) {
+    alert(`文本过长！请控制在 ${MAX_TEXT_CHARS.toLocaleString()} 字符以内（当前 ${content.length.toLocaleString()} 字符）`);
+    return;
+  }
+  const path = `${FOLDER}/${name}`;
+  const encoded = btoa(unescape(encodeURIComponent(content)));
+  try {
+    let sha = null;
+    const checkRes = await apiCall('GET', path);
+    if (checkRes.status === 200) {
+      const data = await checkRes.json();
+      sha = data.sha;
+    }
+    const body = {
+      message: `Update ${name}`,
+      content: encoded,
+      branch: BRANCH,
+      sha: sha
+    };
+    await apiCall('PUT', path, body);
+    alert('保存成功');
+    document.getElementById('textName').value = '';
+    document.getElementById('textContent').value = '';
+    refreshList();
+    fetchRepoSize(); // 更新仓库大小
+  } catch(e) {
+    alert('保存失败: ' + e.message);
+  }
+}
+
+// ---------- 上传文件 ----------
+async function uploadFile() {
+  const fileInput = document.getElementById('fileInput');
+  const file = fileInput.files[0];
+  if (!file) return alert('请选择文件');
+
+  const maxBytes = MAX_FILE_SIZE_MB * 1024 * 1024;
+  if (file.size > maxBytes) {
+    alert(`文件过大！请选择小于 ${MAX_FILE_SIZE_MB} MB 的文件（当前文件约 ${(file.size / 1024 / 1024).toFixed(1)} MB）`);
+    return;
+  }
+
+  const reader = new FileReader();
+  reader.onload = async function(e) {
+    const base64 = e.target.result.split(',')[1];
+    const path = `${FOLDER}/${file.name}`;
+    try {
+      let sha = null;
+      const checkRes = await apiCall('GET', path);
+      if (checkRes.status === 200) {
+        const data = await checkRes.json();
+        sha = data.sha;
+      }
+      const body = {
+        message: `Upload ${file.name}`,
+        content: base64,
+        branch: BRANCH,
+        sha: sha
+      };
+      await apiCall('PUT', path, body);
+      alert('上传成功');
+      fileInput.value = '';
+      refreshList();
+      fetchRepoSize();
+    } catch(err) {
+      alert('上传失败: ' + err.message);
+    }
+  };
+  reader.readAsDataURL(file);
+}
+
+// ---------- 删除文件 ----------
+async function deleteFile(path, sha) {
+  const body = { message: `Delete ${path}`, sha, branch: BRANCH };
+  await apiCall('DELETE', path, body);
+  fetchRepoSize(); // 删除后更新仓库大小
+}
+
+// ---------- 初始化 ----------
+document.addEventListener('DOMContentLoaded', () => {
+  const saved = localStorage.getItem('gh_token');
+  if(saved) document.getElementById('tokenInput').value = saved;
+  // 初始显示速率限制（如果没有API调用则显示默认值）
+  document.getElementById('apiUsed').textContent = '0';
+  document.getElementById('apiRemaining').textContent = '5000';
+  document.getElementById('apiReset').textContent = '待首次请求后更新';
+  // 获取仓库大小
+  fetchRepoSize();
+  refreshList();
+});
+</script>
+</body>
+</html>
