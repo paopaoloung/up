@@ -1,0 +1,4 @@
+github > setting > Developer Settings > Personal access tokens > Fine-grained personal access tokens
+Expiration > No expiration
+Repository access > Only select repositories
+Permissions > Add permissions > Contents > Access: Read and write
